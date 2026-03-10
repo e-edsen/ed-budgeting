@@ -19,8 +19,9 @@ function pruneExpiredBuckets(now: number) {
 }
 
 export function getRateLimitKey(request: NextRequest): string {
-  if (request.ip) {
-    return request.ip;
+  const requestIp = (request as NextRequest & { ip?: string }).ip;
+  if (requestIp) {
+    return requestIp;
   }
 
   const isVercel = Boolean(process.env.VERCEL);

@@ -33,7 +33,7 @@ function isPrefetchRequest(request: NextRequest): boolean {
   return purpose === 'prefetch';
 }
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   if (isPrefetchRequest(request)) {
     return NextResponse.next();
   }
