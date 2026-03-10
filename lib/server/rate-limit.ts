@@ -19,11 +19,18 @@ function pruneExpiredBuckets(now: number) {
 }
 
 export function getRateLimitKey(request: NextRequest): string {
-  const forwardedFor = request.headers.get('x-forwarded-for');
-  if (forwardedFor) {
-    const firstIp = forwardedFor.split(',')[0]?.trim();
-    if (firstIp) {
-      return firstIp;
+  if (request.ip) {
+    return request.ip;
+  }
+
+  const isVercel = Boolean(process.env.VERCEL);
+  if (isVercel) {
+    const forwardedFor = request.headers.get('x-forwarded-for');
+    if (forwardedFor) {
+      const firstIp = forwardedFor.split(',')[0]?.trim();
+      if (firstIp) {
+        return firstIp;
+      }
     }
   }
 

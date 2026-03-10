@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import { Geist, Geist_Mono } from "next/font/google";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import "./globals.css";
@@ -23,8 +24,10 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const nonce = headers().get("x-nonce") ?? undefined;
+
   return (
-    <html lang="en">
+    <html lang="en" data-csp-nonce={nonce}>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >

@@ -339,6 +339,9 @@ function UserConfigDialogForm({
           <span className="block text-zinc-500 dark:text-zinc-400">
             Leave this off if you only want to keep the values for the current browser session.
           </span>
+          <span className="block text-zinc-500 dark:text-zinc-400">
+            Values are sent for calculation only and are not stored on our servers.
+          </span>
         </span>
       </label>
 

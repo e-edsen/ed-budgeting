@@ -48,6 +48,12 @@ export const DASHBOARD_RUNTIME_CONFIG = {
 };
 ```
 
+## Data Handling & Privacy
+
+- User inputs are sent to `/api/dashboard` for calculation only. The app does not store them on the server.
+- If users opt in to “Remember on this browser,” values are saved in `localStorage` on that device.
+- FX rates are fetched from an external provider and do not include user inputs.
+
 ## Environment Variables
 
 Copy `.env.example` if needed.
