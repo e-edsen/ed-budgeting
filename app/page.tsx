@@ -12,6 +12,7 @@ import { SalaryTabContent } from '@/components/dashboard/salary-tab-content';
 import { FinanceTabContent } from '@/components/dashboard/finance-tab-content';
 import { ConfigTabContent } from '@/components/dashboard/config-tab-content';
 import { DASHBOARD_RUNTIME_CONFIG } from '@/lib/config';
+import { buildDashboardDto } from '@/lib/dashboard/build-dashboard';
 import { getSavingsToneClass } from '@/lib/dashboard-content';
 import {
   getDefaultUserConfig,
@@ -21,29 +22,12 @@ import {
   StoredUserConfig,
   USER_CONFIG_STORAGE_KEY,
 } from '@/lib/user-config';
-import { parseDashboardResponse } from '@/lib/validation/dashboard';
+import type { FxState } from '@/lib/fx';
+import { parseFxResponse } from '@/lib/validation/fx';
 
 const DEBUG_ENABLED = process.env.NEXT_PUBLIC_DEBUG_SALARY === '1';
-const DEFAULT_REFRESH_INTERVAL_MS = 60_000;
-const MIN_REFRESH_INTERVAL_MS = 5_000;
-
-function getRetryAfterDelayMs(retryAfterHeader: string | null): number {
-  if (!retryAfterHeader) {
-    return DEFAULT_REFRESH_INTERVAL_MS;
-  }
-
-  const retryAfterSeconds = Number(retryAfterHeader);
-  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
-    return Math.max(MIN_REFRESH_INTERVAL_MS, Math.ceil(retryAfterSeconds * 1000));
-  }
-
-  const retryAtMs = Date.parse(retryAfterHeader);
-  if (Number.isFinite(retryAtMs)) {
-    return Math.max(MIN_REFRESH_INTERVAL_MS, retryAtMs - Date.now());
-  }
-
-  return DEFAULT_REFRESH_INTERVAL_MS;
-}
+const FX_STORAGE_KEY = 'ed-budgeting:fx-state';
+const FX_STORAGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const EMPTY_EMERGENCY_FUND_TARGETS = {
   x6: 0,
@@ -51,6 +35,50 @@ const EMPTY_EMERGENCY_FUND_TARGETS = {
   x24: 0,
   x36: 0,
 };
+
+type StoredFxState = {
+  storedAt: number;
+  value: FxState;
+};
+
+function loadStoredFxState(): FxState | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const rawValue = window.localStorage.getItem(FX_STORAGE_KEY);
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue) as StoredFxState | null;
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+    if (typeof parsed.storedAt !== 'number' || !Number.isFinite(parsed.storedAt)) {
+      return null;
+    }
+    if (Date.now() - parsed.storedAt > FX_STORAGE_MAX_AGE_MS) {
+      return null;
+    }
+    const value = parseFxResponse(parsed.value);
+    return value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredFxState(value: FxState): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  const payload: StoredFxState = {
+    storedAt: Date.now(),
+    value,
+  };
+  window.localStorage.setItem(FX_STORAGE_KEY, JSON.stringify(payload));
+}
 
 export default function Home() {
   const [dashboard, setDashboard] = useState<DashboardDto | null>(null);
@@ -60,10 +88,14 @@ export default function Home() {
   const [isConfigPersisted, setIsConfigPersisted] = useState(false);
   const [isConfigDialogOpen, setIsConfigDialogOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const refreshIntervalRef = useRef(DEFAULT_REFRESH_INTERVAL_MS);
-  const requestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const requestInFlightRef = useRef(false);
-  const rateLimitedUntilRef = useRef<number | null>(null);
+  const [fxState, setFxState] = useState<FxState | null>(null);
+  const fxRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fxRequestInFlightRef = useRef(false);
+  const fxStateRef = useRef<FxState | null>(null);
+
+  useEffect(() => {
+    fxStateRef.current = fxState;
+  }, [fxState]);
 
   useEffect(() => {
     const rawStoredValue =
@@ -99,150 +131,88 @@ export default function Home() {
       setDashboard(null);
       setErrorMessage(null);
       setIsLoading(false);
+      if (fxRefreshTimerRef.current) {
+        clearTimeout(fxRefreshTimerRef.current);
+        fxRefreshTimerRef.current = null;
+      }
       return;
     }
 
-    setIsLoading(true);
+    const restoredFx = loadStoredFxState();
+    if (restoredFx && !fxStateRef.current) {
+      setFxState(restoredFx);
+    }
 
     const clearRefreshTimer = () => {
-      if (requestTimerRef.current) {
-        clearTimeout(requestTimerRef.current);
-        requestTimerRef.current = null;
+      if (fxRefreshTimerRef.current) {
+        clearTimeout(fxRefreshTimerRef.current);
+        fxRefreshTimerRef.current = null;
       }
     };
 
-    const getRateLimitDelayMs = () => {
-      const rateLimitedUntil = rateLimitedUntilRef.current;
-      if (rateLimitedUntil === null) {
-        return 0;
+    const scheduleNextRefresh = (delayMs = DASHBOARD_RUNTIME_CONFIG.fxRefreshMs) => {
+      if (document.visibilityState === 'hidden') {
+        return;
       }
-
-      const remainingMs = rateLimitedUntil - Date.now();
-      if (remainingMs <= 0) {
-        rateLimitedUntilRef.current = null;
-        return 0;
-      }
-
-      return remainingMs;
-    };
-
-    const scheduleNextRefresh = (delayMs = refreshIntervalRef.current) => {
       clearRefreshTimer();
-      requestTimerRef.current = setTimeout(() => {
-        void fetchDashboard('timer');
+      fxRefreshTimerRef.current = setTimeout(() => {
+        void fetchFxState('timer');
       }, delayMs);
     };
 
-    const fetchDashboard = async (trigger: 'initial' | 'timer' | 'focus' | 'visibility') => {
-      if (requestInFlightRef.current) {
+    const fetchFxState = async (trigger: 'initial' | 'timer' | 'visibility') => {
+      if (fxRequestInFlightRef.current) {
         return;
       }
 
-      const rateLimitDelayMs = getRateLimitDelayMs();
-      if (rateLimitDelayMs > 0) {
-        refreshIntervalRef.current = Math.max(MIN_REFRESH_INTERVAL_MS, rateLimitDelayMs);
-        scheduleNextRefresh(rateLimitDelayMs);
-        return;
-      }
-
-      requestInFlightRef.current = true;
+      fxRequestInFlightRef.current = true;
       clearRefreshTimer();
 
       const startedAt = performance.now();
       const requestStartedAt = new Date().toISOString();
-      const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const clientOffsetMinutes = new Date().getTimezoneOffset();
-      const requestBody = {
-        clientTimezone: timeZone || null,
-        clientOffsetMinutes,
-        config: {
-          salaryAmount: userConfig.salaryAmount,
-          salaryCurrency: userConfig.salaryCurrency,
-          monthlySpendingAmount: userConfig.monthlySpendingAmount,
-          monthlySpendingCurrency: userConfig.monthlySpendingCurrency,
-          monthlyRentAmount: userConfig.monthlyRentAmount ?? 0,
-          monthlyRentCurrency: userConfig.monthlyRentCurrency ?? 'IDR',
-        },
-      };
+
+      if (!fxStateRef.current) {
+        setIsLoading(true);
+      }
 
       try {
         if (DEBUG_ENABLED) {
-          console.debug('salary-debug-config-request', {
+          console.debug('salary-debug-fx-request', {
             requestStartedAt,
             configSource: isConfigPersisted ? 'local-storage' : 'session-memory',
             trigger,
-            hasClientTimezone: Boolean(requestBody.clientTimezone),
-            clientOffsetMinutes: requestBody.clientOffsetMinutes,
           });
         }
 
-        const response = await fetch('/api/dashboard', {
-          method: 'POST',
-          cache: 'no-store',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(requestBody),
-        });
+        const response = await fetch('/api/fx');
         const requestDurationMs = Number((performance.now() - startedAt).toFixed(2));
-
-        if (response.status === 429) {
-          const retryAfterMs = getRetryAfterDelayMs(response.headers.get('Retry-After'));
-
-          if (isCancelled) {
-            return;
-          }
-
-          rateLimitedUntilRef.current = Date.now() + retryAfterMs;
-          refreshIntervalRef.current = Math.max(MIN_REFRESH_INTERVAL_MS, retryAfterMs);
-          setErrorMessage(`Too many refreshes. Retrying in ${Math.ceil(retryAfterMs / 1000)}s.`);
-          setIsLoading(false);
-
-          if (DEBUG_ENABLED) {
-            console.debug('salary-debug-fetch', {
-              requestStartedAt,
-              requestDurationMs,
-              responseStatus: response.status,
-              payloadGeneratedAt: null,
-              refreshIntervalMs: refreshIntervalRef.current,
-              retryAfterMs,
-              error: 'rate-limited',
-            });
-          }
-
-          return;
-        }
 
         if (!response.ok) {
           throw new Error(`status-${response.status}`);
         }
 
         const responsePayload: unknown = await response.json();
-        const payload = parseDashboardResponse(responsePayload);
+        const payload = parseFxResponse(responsePayload);
         if (!payload) {
-          throw new Error('invalid-dashboard-response');
+          throw new Error('invalid-fx-response');
         }
 
         if (isCancelled) {
           return;
         }
 
-        refreshIntervalRef.current = Math.max(
-          MIN_REFRESH_INTERVAL_MS,
-          payload.config.refreshIntervalMs
-        );
-        rateLimitedUntilRef.current = null;
-        setDashboard(payload);
+        setFxState(payload);
+        saveStoredFxState(payload);
         setErrorMessage(null);
-        setIsLoading(false);
 
         if (DEBUG_ENABLED) {
-          console.debug('salary-debug-fetch', {
+          console.debug('salary-debug-fx-response', {
             requestStartedAt,
             requestDurationMs,
             responseStatus: response.status,
-            payloadGeneratedAt: payload.generatedAt,
-            refreshIntervalMs: refreshIntervalRef.current,
+            usdToIdr: payload.usdToIdr,
+            lastUpdatedAt: payload.lastUpdatedAt,
+            isStale: payload.isStale,
           });
         }
       } catch (error) {
@@ -251,59 +221,85 @@ export default function Home() {
           return;
         }
 
-        setErrorMessage(
-          error instanceof Error && error.message === 'invalid-dashboard-response'
-            ? 'Received invalid dashboard data'
-            : 'Failed to load dashboard data'
-        );
-        setIsLoading(false);
+        setErrorMessage('Failed to load FX rate');
 
         if (DEBUG_ENABLED) {
-          console.debug('salary-debug-fetch', {
+          console.debug('salary-debug-fx-response', {
             requestStartedAt,
             requestDurationMs,
             responseStatus: null,
-            payloadGeneratedAt: null,
-            refreshIntervalMs: refreshIntervalRef.current,
             error: error instanceof Error ? error.message : 'unknown-error',
           });
         }
       } finally {
-        requestInFlightRef.current = false;
+        fxRequestInFlightRef.current = false;
 
         if (isCancelled) {
           return;
         }
 
+        setIsLoading(false);
         scheduleNextRefresh();
       }
     };
 
-    const handleWindowFocus = () => {
-      void fetchDashboard('focus');
-    };
-
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        void fetchDashboard('visibility');
+        void fetchFxState('visibility');
+      } else {
+        clearRefreshTimer();
       }
     };
 
-    void fetchDashboard('initial');
-    window.addEventListener('focus', handleWindowFocus);
+    void fetchFxState('initial');
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       isCancelled = true;
       clearRefreshTimer();
-      requestInFlightRef.current = false;
-      rateLimitedUntilRef.current = null;
-      window.removeEventListener('focus', handleWindowFocus);
+      fxRequestInFlightRef.current = false;
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [isBootstrapReady, isConfigPersisted, userConfig]);
 
-  const fxState = dashboard?.fx ?? {
+  useEffect(() => {
+    if (!isBootstrapReady) {
+      return;
+    }
+
+    if (!userConfig) {
+      setDashboard(null);
+      return;
+    }
+
+    if (!fxState) {
+      return;
+    }
+
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const clientOffsetMinutes = new Date().getTimezoneOffset();
+    const config: DashboardUserConfigDto = {
+      salaryAmount: userConfig.salaryAmount,
+      salaryCurrency: userConfig.salaryCurrency,
+      monthlySpendingAmount: userConfig.monthlySpendingAmount,
+      monthlySpendingCurrency: userConfig.monthlySpendingCurrency,
+      monthlyRentAmount: userConfig.monthlyRentAmount ?? 0,
+      monthlyRentCurrency: userConfig.monthlyRentCurrency ?? 'IDR',
+    };
+
+    const payload = buildDashboardDto({
+      clientTimezone: timeZone || null,
+      clientOffsetMinutes,
+      config,
+      fxState,
+      now: new Date(),
+    });
+
+    setDashboard(payload);
+    setIsLoading(false);
+  }, [isBootstrapReady, userConfig, fxState]);
+
+  const fxDisplay = dashboard?.fx ?? {
     usdToIdr: 16000,
     isStale: true,
     lastUpdatedAt: null,
@@ -391,9 +387,8 @@ export default function Home() {
     setUserConfig(storedConfig);
     setIsConfigPersisted(options.persistInBrowser);
     setIsConfigDialogOpen(false);
-    rateLimitedUntilRef.current = null;
     setErrorMessage(null);
-    setIsLoading(true);
+    setIsLoading(!fxState);
   };
 
   const handleResetUserConfig = () => {
@@ -407,7 +402,6 @@ export default function Home() {
     setDashboard(null);
     setUserConfig(null);
     setIsConfigPersisted(false);
-    rateLimitedUntilRef.current = null;
     setErrorMessage(null);
     setIsLoading(false);
   };
@@ -438,7 +432,7 @@ export default function Home() {
         <DashboardHeaderCard
           nowLabel={nowLabel}
           timezoneLabel={timezoneLabel}
-          isFxStale={fxState.isStale}
+          isFxStale={fxDisplay.isStale}
           onEditValues={() => setIsConfigDialogOpen(true)}
         />
 
@@ -453,7 +447,7 @@ export default function Home() {
         {isLoading && !dashboard && userConfig ? (
           <Card className="border-zinc-300/70 dark:border-zinc-800">
             <CardContent className="py-6 text-sm text-zinc-500 dark:text-zinc-400">
-              Fetching dashboard data...
+              Fetching FX rate...
             </CardContent>
           </Card>
         ) : null}
@@ -484,9 +478,9 @@ export default function Home() {
               savingsToneClass={savingsToneClass}
               disposableIncomeIDR={disposableIncomeIDR}
               disposableIncomeUSD={disposableIncomeUSD}
-              fxRate={fxState.usdToIdr}
-              isFxStale={fxState.isStale}
-              lastUpdatedLabel={fxState.lastUpdatedLabel}
+              fxRate={fxDisplay.usdToIdr}
+              isFxStale={fxDisplay.isStale}
+              lastUpdatedLabel={fxDisplay.lastUpdatedLabel}
             />
 
             <Tabs defaultValue="salary" className="space-y-6">
@@ -552,9 +546,9 @@ export default function Home() {
                   isConfigPersisted={isConfigPersisted}
                   savedAtLabel={savedAtLabel}
                   timezoneLabel={timezoneLabel}
-                  fxRate={fxState.usdToIdr}
-                  isFxStale={fxState.isStale}
-                  lastUpdatedLabel={fxState.lastUpdatedLabel}
+                  fxRate={fxDisplay.usdToIdr}
+                  isFxStale={fxDisplay.isStale}
+                  lastUpdatedLabel={fxDisplay.lastUpdatedLabel}
                   refreshIntervalMs={refreshIntervalMs}
                   fxRefreshMs={fxRefreshMs}
                   onEditValues={() => setIsConfigDialogOpen(true)}

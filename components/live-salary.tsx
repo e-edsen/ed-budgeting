@@ -19,7 +19,7 @@ import { DashboardDto } from '@/lib/contracts/dashboard';
 import { calculateLiveSalaryMetrics, LiveSalaryMetrics } from '@/lib/live-salary';
 
 const DEBUG_ENABLED = process.env.NEXT_PUBLIC_DEBUG_SALARY === '1';
-const LIVE_TICKER_INTERVAL_MS = 50;
+const LIVE_TICKER_INTERVAL_MS = 250;
 type LiveSalaryStore = {
   getSnapshot: () => LiveSalaryMetrics | null;
   subscribe: (listener: () => void) => () => void;
